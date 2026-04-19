@@ -37,7 +37,7 @@ class MarkdownFolderApp(Adw.Application):
         action = Gio.SimpleAction.new("new-window", None)
         action.connect("activate", self._on_new_window)
         self.add_action(action)
-        self.set_accels_for_action("app.new-window", ["<primary>n"])
+        self.set_accels_for_action("app.new-window", ["<primary><shift>n"])
 
     def _on_activate(self, _app):
         self._create_window()
