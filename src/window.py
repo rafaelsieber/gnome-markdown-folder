@@ -396,12 +396,6 @@ class MarkdownWindow(Adw.ApplicationWindow):
         open_btn.connect("clicked", self._on_open_folder)
         hbar.pack_start(open_btn)
 
-        self._git_btn = Gtk.Button(icon_name="vcs-locally-modified-symbolic",
-                                   tooltip_text="Git changes",
-                                   visible=False)
-        self._git_btn.connect("clicked", self._on_show_git)
-        hbar.pack_end(self._git_btn)
-
         # menu button
         menu = Gio.Menu()
         menu.append("New Window", "app.new-window")
@@ -634,7 +628,6 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self._root_path = path
         self._is_git = _is_git_repo(path)
         self._folder_label.set_label(str(path))
-        self._git_btn.set_visible(self._is_git)
         self._win_title.set_subtitle(path.name)
         self.set_title(f"Markdown Folder — {path.name}")
         self._tree_store.clear()
