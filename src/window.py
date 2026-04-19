@@ -1,0 +1,741 @@
+"""
+Main window — uses the most modern libadwaita 1.10 / GTK4 widgets:
+
+  • AdwNavigationSplitView  — responsive sidebar + content
+  • AdwBreakpoint           — collapses at narrow widths
+  • AdwToolbarView          — proper toolbar regions
+  • AdwTabView + AdwTabBar  — multi-file tabs
+  • AdwToggleGroup          — Edit / Preview switcher (1.7)
+  • AdwBanner               — per-tab unsaved-changes bar (1.3)
+  • AdwToastOverlay         — save / error toasts
+  • AdwAlertDialog          — "unsaved changes?" prompt (1.5)
+"""
+
+from __future__ import annotations
+
+import re
+import threading
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+# Optional: GtkSource for syntax highlighting
+try:
+    gi.require_version("GtkSource", "5")
+    from gi.repository import GtkSource
+    _HAVE_SOURCE = True
+except Exception:
+    _HAVE_SOURCE = False
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _run_git(cwd: Path, *args: str) -> tuple[str, str, int]:
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=15
+        )
+        return r.stdout, r.stderr, r.returncode
+    except Exception as e:
+        return "", str(e), -1
+
+
+def _is_git_repo(path: Path) -> bool:
+    _, _, rc = _run_git(path, "rev-parse", "--is-inside-work-tree")
+    return rc == 0
+
+
+_MD_EXTS = {".md", ".markdown", ".mdx", ".txt", ".rst"}
+
+
+# ── per-tab editor state ─────────────────────────────────────────────────────
+
+class EditorPage(GObject.Object):
+    """Holds the state for one open file tab."""
+
+    __gtype_name__ = "EditorPage"
+
+    def __init__(self, path: Path):
+        super().__init__()
+        self.path = path
+        self._modified = False
+
+        # --- build widget tree ---
+        self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        # unsaved-changes banner
+        self.banner = Adw.Banner(
+            title="Unsaved changes",
+            button_label="Save",
+            revealed=False,
+        )
+        self.banner.connect("button-clicked", lambda _: self.save())
+        self.root.append(self.banner)
+
+        # view stack: editor / preview
+        self.stack = Gtk.Stack()
+        self.stack.set_vexpand(True)
+        self.root.append(self.stack)
+
+        # — editor —
+        scroll_ed = Gtk.ScrolledWindow(vexpand=True)
+        if _HAVE_SOURCE:
+            buf = GtkSource.Buffer()
+            lm = GtkSource.LanguageManager.get_default()
+            lang = lm.get_language("markdown")
+            if lang:
+                buf.set_language(lang)
+            sm = GtkSource.StyleSchemeManager.get_default()
+            scheme = sm.get_scheme("Adwaita-dark") or sm.get_scheme("classic")
+            if scheme:
+                buf.set_style_scheme(scheme)
+            self.text_view = GtkSource.View(buffer=buf)
+            self.text_view.set_show_line_numbers(True)
+            self.text_view.set_highlight_current_line(True)
+            self.text_view.set_auto_indent(True)
+            self.text_view.set_tab_width(2)
+        else:
+            self.text_view = Gtk.TextView()
+
+        self.text_view.set_monospace(True)
+        self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.text_view.set_left_margin(12)
+        self.text_view.set_right_margin(12)
+        self.text_view.set_top_margin(8)
+        self.text_view.set_bottom_margin(8)
+        self.text_view.get_buffer().connect("changed", self._on_changed)
+        scroll_ed.set_child(self.text_view)
+        self.stack.add_named(scroll_ed, "edit")
+
+        # — preview —
+        scroll_pr = Gtk.ScrolledWindow(vexpand=True)
+        self.preview_view = Gtk.TextView(
+            editable=False,
+            cursor_visible=False,
+            left_margin=20,
+            right_margin=20,
+            top_margin=16,
+            bottom_margin=16,
+        )
+        self.preview_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        scroll_pr.set_child(self.preview_view)
+        self.stack.add_named(scroll_pr, "preview")
+
+        # callbacks
+        self._on_save_cb: list = []
+
+    # ── modification tracking ─────────────────────────────────────────────
+
+    def _on_changed(self, _buf):
+        if not self._modified:
+            self._modified = True
+            self.banner.set_revealed(True)
+            self.notify("modified")
+
+    def get_modified(self) -> bool:
+        return self._modified
+
+    # ── file I/O ──────────────────────────────────────────────────────────
+
+    def load(self) -> bool:
+        try:
+            text = self.path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        buf = self.text_view.get_buffer()
+        buf.handler_block_by_func(self._on_changed)
+        buf.set_text(text)
+        buf.handler_unblock_by_func(self._on_changed)
+        self._modified = False
+        self.banner.set_revealed(False)
+        return True
+
+    def save(self) -> bool:
+        buf = self.text_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        try:
+            self.path.write_text(text, encoding="utf-8")
+        except OSError:
+            return False
+        self._modified = False
+        self.banner.set_revealed(False)
+        self.notify("modified")
+        for cb in self._on_save_cb:
+            cb(self)
+        return True
+
+    # ── view switching ────────────────────────────────────────────────────
+
+    def show_edit(self):
+        self.stack.set_visible_child_name("edit")
+
+    def show_preview(self):
+        buf = self.text_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        _render_markdown(self.preview_view, text)
+        self.stack.set_visible_child_name("preview")
+
+    def current_view_name(self) -> str:
+        child = self.stack.get_visible_child()
+        return self.stack.get_page(child).get_name() if child else "edit"
+
+
+# ── markdown preview renderer ─────────────────────────────────────────────────
+
+def _render_markdown(tv: Gtk.TextView, text: str):
+    buf = tv.get_buffer()
+    buf.set_text("")
+    tt = buf.get_tag_table()
+
+    def tag(name: str, **kw) -> Gtk.TextTag:
+        t = tt.lookup(name)
+        if t is None:
+            t = buf.create_tag(name, **kw)
+        return t
+
+    tag("h1", weight=Pango.Weight.BOLD, scale=2.0,
+        pixels_above_lines=14, pixels_below_lines=6)
+    tag("h2", weight=Pango.Weight.BOLD, scale=1.6,
+        pixels_above_lines=12, pixels_below_lines=4)
+    tag("h3", weight=Pango.Weight.BOLD, scale=1.3,
+        pixels_above_lines=8, pixels_below_lines=2)
+    tag("h4", weight=Pango.Weight.BOLD, scale=1.1)
+    tag("bold", weight=Pango.Weight.BOLD)
+    tag("italic", style=Pango.Style.ITALIC)
+    tag("strike", strikethrough=True)
+    tag("code_inline", family="monospace",
+        background="#2d2d2d", foreground="#f8f8f2",
+        pixels_above_lines=1, pixels_below_lines=1)
+    tag("code_block", family="monospace",
+        background="#1e1e1e", foreground="#d4d4d4",
+        left_margin=16, right_margin=16,
+        pixels_above_lines=4, pixels_below_lines=4)
+    tag("blockquote", foreground="#aaaaaa",
+        style=Pango.Style.ITALIC, left_margin=28)
+    tag("hr", foreground="#555555")
+    tag("bullet", left_margin=20)
+    tag("link", foreground="#4a9eff", underline=Pango.Underline.SINGLE)
+
+    _INLINE = re.compile(
+        r'\*\*(.+?)\*\*'       # **bold**
+        r'|__(.+?)__'          # __bold__
+        r'|\*(.+?)\*'          # *italic*
+        r'|_(.+?)_'            # _italic_
+        r'|~~(.+?)~~'          # ~~strike~~
+        r'|`(.+?)`'            # `code`
+        r'|\[(.+?)\]\((.+?)\)' # [text](url)
+    )
+
+    def insert_inline(line_text: str, default_tag: str | None = None):
+        last = 0
+        for m in _INLINE.finditer(line_text):
+            before = line_text[last:m.start()]
+            if before:
+                e = buf.get_end_iter()
+                if default_tag:
+                    buf.insert_with_tags_by_name(e, before, default_tag)
+                else:
+                    buf.insert(e, before)
+            e = buf.get_end_iter()
+            if m.group(1):   buf.insert_with_tags_by_name(e, m.group(1), "bold")
+            elif m.group(2): buf.insert_with_tags_by_name(e, m.group(2), "bold")
+            elif m.group(3): buf.insert_with_tags_by_name(e, m.group(3), "italic")
+            elif m.group(4): buf.insert_with_tags_by_name(e, m.group(4), "italic")
+            elif m.group(5): buf.insert_with_tags_by_name(e, m.group(5), "strike")
+            elif m.group(6): buf.insert_with_tags_by_name(e, m.group(6), "code_inline")
+            elif m.group(7): buf.insert_with_tags_by_name(e, m.group(7), "link")
+            last = m.end()
+        rest = line_text[last:]
+        if rest:
+            e = buf.get_end_iter()
+            if default_tag:
+                buf.insert_with_tags_by_name(e, rest, default_tag)
+            else:
+                buf.insert(e, rest)
+
+    lines = text.split("\n")
+    in_code = False
+    code_lines: list[str] = []
+
+    for line in lines:
+        e = buf.get_end_iter()
+
+        if line.startswith("```"):
+            if in_code:
+                in_code = False
+                block = "\n".join(code_lines)
+                buf.insert_with_tags_by_name(buf.get_end_iter(),
+                                             block + "\n", "code_block")
+                code_lines = []
+            else:
+                in_code = True
+            continue
+
+        if in_code:
+            code_lines.append(line)
+            continue
+
+        if line.startswith("#### "):
+            insert_inline(line[5:], "h4"); buf.insert(buf.get_end_iter(), "\n")
+        elif line.startswith("### "):
+            insert_inline(line[4:], "h3"); buf.insert(buf.get_end_iter(), "\n")
+        elif line.startswith("## "):
+            insert_inline(line[3:], "h2"); buf.insert(buf.get_end_iter(), "\n")
+        elif line.startswith("# "):
+            insert_inline(line[2:], "h1"); buf.insert(buf.get_end_iter(), "\n")
+        elif line.startswith("> "):
+            insert_inline(line[2:], "blockquote")
+            buf.insert(buf.get_end_iter(), "\n")
+        elif re.match(r'^[-*_]{3,}$', line.strip()):
+            buf.insert_with_tags_by_name(buf.get_end_iter(),
+                                         "─" * 72 + "\n", "hr")
+        elif re.match(r'^[-*+] ', line):
+            buf.insert_with_tags_by_name(buf.get_end_iter(), "  • ", "bullet")
+            insert_inline(line[2:], "bullet")
+            buf.insert(buf.get_end_iter(), "\n")
+        elif re.match(r'^\d+\. ', line):
+            m = re.match(r'^(\d+)\. (.*)', line)
+            if m:
+                buf.insert_with_tags_by_name(
+                    buf.get_end_iter(), f"  {m.group(1)}. ", "bullet")
+                insert_inline(m.group(2), "bullet")
+                buf.insert(buf.get_end_iter(), "\n")
+        else:
+            insert_inline(line)
+            buf.insert(buf.get_end_iter(), "\n")
+
+
+# ── main window ───────────────────────────────────────────────────────────────
+
+class MarkdownWindow(Adw.ApplicationWindow):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.set_title("Markdown Folder")
+        self.set_default_size(1280, 800)
+        self.set_icon_name("text-editor-symbolic")
+
+        self._root_path: Path | None = None
+        self._is_git = False
+        # map path → AdwTabPage
+        self._open_tabs: dict[Path, Adw.TabPage] = {}
+
+        self._build_ui()
+        self._setup_actions()
+        self._setup_breakpoint()
+
+    # ── breakpoint (responsive) ───────────────────────────────────────────
+
+    def _setup_breakpoint(self):
+        bp = Adw.Breakpoint()
+        condition = Adw.BreakpointCondition.parse("max-width: 720sp")
+        bp.set_condition(condition)
+        bp.add_setter(self._split_view, "collapsed", GLib.Variant.new_boolean(True))
+        self.add_breakpoint(bp)
+
+    # ── UI construction ───────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # Toast overlay wraps everything
+        self._toast_overlay = Adw.ToastOverlay()
+        self.set_content(self._toast_overlay)
+
+        # NavigationSplitView: sidebar | content
+        self._split_view = Adw.NavigationSplitView(
+            min_sidebar_width=200,
+            max_sidebar_width=320,
+            sidebar_width_fraction=0.22,
+        )
+        self._toast_overlay.set_child(self._split_view)
+
+        self._split_view.set_sidebar(self._build_sidebar_page())
+        self._split_view.set_content(self._build_content_page())
+
+    # ── sidebar ───────────────────────────────────────────────────────────
+
+    def _build_sidebar_page(self) -> Adw.NavigationPage:
+        page = Adw.NavigationPage(title="Files")
+
+        toolbar = Adw.ToolbarView()
+        page.set_child(toolbar)
+
+        # header bar
+        hbar = Adw.HeaderBar()
+
+        open_btn = Gtk.Button(icon_name="folder-open-symbolic",
+                              tooltip_text="Open folder (Ctrl+O)")
+        open_btn.connect("clicked", self._on_open_folder)
+        hbar.pack_start(open_btn)
+
+        self._git_btn = Gtk.Button(icon_name="vcs-locally-modified-symbolic",
+                                   tooltip_text="Git changes",
+                                   visible=False)
+        self._git_btn.connect("clicked", self._on_show_git)
+        hbar.pack_end(self._git_btn)
+
+        # menu button
+        menu = Gio.Menu()
+        menu.append("New Window", "app.new-window")
+        menu.append("About", "app.about")
+        menu.append("Quit", "app.quit")
+        menu_btn = Gtk.MenuButton(
+            icon_name="open-menu-symbolic",
+            menu_model=menu,
+            primary=True,
+        )
+        hbar.pack_end(menu_btn)
+
+        toolbar.add_top_bar(hbar)
+
+        # folder label
+        self._folder_label = Gtk.Label(
+            label="No folder open",
+            ellipsize=Pango.EllipsizeMode.START,
+            margin_start=8, margin_end=8,
+            margin_top=4, margin_bottom=4,
+            halign=Gtk.Align.START,
+            css_classes=["caption", "dim-label"],
+        )
+        toolbar.add_top_bar(self._folder_label)
+
+        # file tree
+        scroll = Gtk.ScrolledWindow(vexpand=True,
+                                    hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+
+        self._tree_store = Gtk.TreeStore(str, str, bool)  # name, path, is_dir
+        self._tree_view = Gtk.TreeView(
+            model=self._tree_store,
+            headers_visible=False,
+            activate_on_single_click=False,
+        )
+        self._tree_view.add_css_class("navigation-sidebar")
+
+        # column: icon + name
+        col = Gtk.TreeViewColumn()
+        r_icon = Gtk.CellRendererPixbuf()
+        r_text = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        col.pack_start(r_icon, False)
+        col.pack_start(r_text, True)
+        col.add_attribute(r_text, "text", 0)
+        col.set_cell_data_func(r_icon, self._icon_cell_data)
+        self._tree_view.append_column(col)
+
+        self._tree_view.connect("row-activated", self._on_row_activated)
+        self._tree_view.connect("test-expand-row", self._on_row_expand)
+
+        scroll.set_child(self._tree_view)
+        toolbar.set_content(scroll)
+
+        return page
+
+    def _icon_cell_data(self, _col, cell, model, it, _data):
+        is_dir = model.get_value(it, 2)
+        cell.set_property(
+            "icon-name",
+            "folder-symbolic" if is_dir else "text-x-generic-symbolic"
+        )
+
+    # ── content (tabs) ────────────────────────────────────────────────────
+
+    def _build_content_page(self) -> Adw.NavigationPage:
+        self._content_nav_page = Adw.NavigationPage(title="Editor")
+
+        toolbar = Adw.ToolbarView()
+        self._content_nav_page.set_child(toolbar)
+
+        # header bar
+        hbar = Adw.HeaderBar()
+
+        self._win_title = Adw.WindowTitle(title="Markdown Folder",
+                                          subtitle="")
+        hbar.set_title_widget(self._win_title)
+
+        # Save button
+        self._save_btn = Gtk.Button(
+            icon_name="document-save-symbolic",
+            tooltip_text="Save (Ctrl+S)",
+            sensitive=False,
+        )
+        self._save_btn.connect("clicked", lambda _: self._save_current())
+        hbar.pack_end(self._save_btn)
+
+        # Edit / Preview toggle group (libadwaita 1.7)
+        self._toggle_group = Adw.ToggleGroup()
+        self._toggle_group.add_css_class("flat")
+        self._toggle_group.set_sensitive(False)
+
+        t_edit = Adw.Toggle(label="Edit", name="edit")
+        t_prev = Adw.Toggle(label="Preview", name="preview")
+        self._toggle_group.add(t_edit)
+        self._toggle_group.add(t_prev)
+        self._toggle_group.set_active_name("edit")
+        self._toggle_group.connect("notify::active-name", self._on_view_toggled)
+        hbar.pack_end(self._toggle_group)
+
+        toolbar.add_top_bar(hbar)
+
+        # Tab bar (below header)
+        self._tab_view = Adw.TabView(vexpand=True)
+        self._tab_view.connect("notify::selected-page", self._on_tab_changed)
+        self._tab_view.connect("close-page", self._on_tab_close)
+
+        tab_bar = Adw.TabBar(view=self._tab_view, autohide=False)
+        toolbar.add_top_bar(tab_bar)
+
+        # Welcome status page (shown when no tabs)
+        self._welcome = Adw.StatusPage(
+            title="Markdown Folder",
+            description="Open a folder from the sidebar to start browsing "
+                        "and editing markdown files.",
+            icon_name="text-editor-symbolic",
+            vexpand=True,
+        )
+
+        self._content_stack = Gtk.Stack(vexpand=True)
+        self._content_stack.add_named(self._welcome, "welcome")
+        self._content_stack.add_named(self._tab_view, "tabs")
+        self._content_stack.set_visible_child_name("welcome")
+
+        toolbar.set_content(self._content_stack)
+
+        return self._content_nav_page
+
+    # ── actions / shortcuts ───────────────────────────────────────────────
+
+    def _setup_actions(self):
+        # Save
+        a = Gio.SimpleAction.new("save", None)
+        a.connect("activate", lambda *_: self._save_current())
+        self.add_action(a)
+        self.get_application().set_accels_for_action("win.save", ["<primary>s"])
+
+        # Open folder
+        a = Gio.SimpleAction.new("open-folder", None)
+        a.connect("activate", lambda *_: self._on_open_folder(None))
+        self.add_action(a)
+        self.get_application().set_accels_for_action("win.open-folder",
+                                                     ["<primary>o"])
+
+    # ── folder loading ────────────────────────────────────────────────────
+
+    def _on_open_folder(self, _btn):
+        d = Gtk.FileDialog(title="Open Folder")
+        d.select_folder(self, None, self._folder_selected_cb)
+
+    def _folder_selected_cb(self, dialog, result):
+        try:
+            f = dialog.select_folder_finish(result)
+        except GLib.Error:
+            return
+        if f:
+            self.load_folder(Path(f.get_path()))
+
+    def load_folder(self, path: Path):
+        self._root_path = path
+        self._is_git = _is_git_repo(path)
+        self._folder_label.set_label(str(path))
+        self._git_btn.set_visible(self._is_git)
+        self._win_title.set_subtitle(path.name)
+        self.set_title(f"Markdown Folder — {path.name}")
+        self._tree_store.clear()
+        self._populate_tree(None, path)
+
+    def _populate_tree(self, parent_it, directory: Path, depth: int = 0):
+        if depth > 12:
+            return
+        try:
+            entries = sorted(
+                directory.iterdir(),
+                key=lambda p: (not p.is_dir(), p.name.lower()),
+            )
+        except PermissionError:
+            return
+
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            is_dir = entry.is_dir()
+            if is_dir or entry.suffix.lower() in _MD_EXTS:
+                row = self._tree_store.append(
+                    parent_it, [entry.name, str(entry), is_dir]
+                )
+                if is_dir:
+                    # placeholder child so expander arrow appears
+                    self._tree_store.append(row, ["", "", False])
+
+    def _on_row_expand(self, _tv, it, _path):
+        """Lazy-load directory children on first expand."""
+        child = self._tree_store.iter_children(it)
+        while child:
+            self._tree_store.remove(child)
+            child = self._tree_store.iter_children(it)
+        dir_path = Path(self._tree_store.get_value(it, 1))
+        self._populate_tree(it, dir_path)
+        return False  # allow expansion
+
+    def _on_row_activated(self, _tv, path, _col):
+        it = self._tree_store.get_iter(path)
+        if not it:
+            return
+        is_dir = self._tree_store.get_value(it, 2)
+        if is_dir:
+            return
+        file_path = Path(self._tree_store.get_value(it, 1))
+        if file_path.exists():
+            self.open_file(file_path)
+            # on mobile (collapsed), show content pane
+            self._split_view.set_show_content(True)
+
+    # ── tab management ────────────────────────────────────────────────────
+
+    def open_file(self, path: Path):
+        # If already open, just switch to that tab
+        if path in self._open_tabs:
+            self._tab_view.set_selected_page(self._open_tabs[path])
+            return
+
+        ep = EditorPage(path)
+        if not ep.load():
+            self._toast("Could not read file", error=True)
+            return
+
+        ep._on_save_cb.append(self._on_editor_saved)
+
+        self._content_stack.set_visible_child_name("tabs")
+
+        page = self._tab_view.append(ep.root)
+        page.set_title(path.name)
+        page.set_icon(Gio.ThemedIcon.new("text-x-generic-symbolic"))
+        page.set_tooltip(str(path))
+
+        # store cross-reference
+        page._editor = ep  # type: ignore[attr-defined]
+        self._open_tabs[path] = page
+
+        self._tab_view.set_selected_page(page)
+
+    def _on_tab_changed(self, tab_view, _param):
+        page = tab_view.get_selected_page()
+        if page is None:
+            self._win_title.set_title("Markdown Folder")
+            self._win_title.set_subtitle(
+                self._root_path.name if self._root_path else ""
+            )
+            self._save_btn.set_sensitive(False)
+            self._toggle_group.set_sensitive(False)
+            return
+
+        ep: EditorPage = page._editor  # type: ignore[attr-defined]
+        self._win_title.set_title(ep.path.name)
+        if self._root_path:
+            try:
+                rel = ep.path.relative_to(self._root_path)
+                self._win_title.set_subtitle(str(rel.parent)
+                                             if str(rel.parent) != "."
+                                             else "")
+            except ValueError:
+                self._win_title.set_subtitle("")
+
+        self._save_btn.set_sensitive(ep.get_modified())
+        self._toggle_group.set_sensitive(True)
+        # sync toggle to current view
+        view_name = ep.current_view_name()
+        if self._toggle_group.get_active_name() != view_name:
+            self._toggle_group.set_active_name(view_name)
+
+    def _on_tab_close(self, _tv, page) -> bool:
+        ep: EditorPage = page._editor  # type: ignore[attr-defined]
+        if ep.get_modified():
+            self._ask_save_close(ep, page)
+            return True  # we handle closing ourselves
+        self._close_tab(page)
+        return True
+
+    def _close_tab(self, page: Adw.TabPage):
+        ep: EditorPage = page._editor  # type: ignore[attr-defined]
+        self._open_tabs.pop(ep.path, None)
+        self._tab_view.close_page_finish(page, True)
+        if self._tab_view.get_n_pages() == 0:
+            self._content_stack.set_visible_child_name("welcome")
+            self._win_title.set_title("Markdown Folder")
+            self._win_title.set_subtitle(
+                self._root_path.name if self._root_path else ""
+            )
+            self._save_btn.set_sensitive(False)
+            self._toggle_group.set_sensitive(False)
+
+    def _ask_save_close(self, ep: EditorPage, page: Adw.TabPage):
+        dialog = Adw.AlertDialog(
+            heading="Save changes?",
+            body=f'"{ep.path.name}" has unsaved changes.',
+        )
+        dialog.add_response("discard", "Discard")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("save", "Save")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("save")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response):
+            if response == "cancel":
+                self._tab_view.close_page_finish(page, False)
+            elif response == "save":
+                ep.save()
+                self._close_tab(page)
+            else:
+                self._close_tab(page)
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    # ── save ──────────────────────────────────────────────────────────────
+
+    def _save_current(self):
+        page = self._tab_view.get_selected_page()
+        if page is None:
+            return
+        ep: EditorPage = page._editor  # type: ignore[attr-defined]
+        if ep.save():
+            self._toast(f"Saved {ep.path.name}")
+        else:
+            self._toast(f"Could not save {ep.path.name}", error=True)
+
+    def _on_editor_saved(self, ep: EditorPage):
+        self._save_btn.set_sensitive(False)
+        # update tab title (remove dot indicator if we add one later)
+        if ep.path in self._open_tabs:
+            self._open_tabs[ep.path].set_title(ep.path.name)
+
+    # ── toggle edit / preview ─────────────────────────────────────────────
+
+    def _on_view_toggled(self, tg, _param):
+        page = self._tab_view.get_selected_page()
+        if page is None:
+            return
+        ep: EditorPage = page._editor  # type: ignore[attr-defined]
+        name = tg.get_active_name()
+        if name == "preview":
+            ep.show_preview()
+        else:
+            ep.show_edit()
+
+    # ── git ───────────────────────────────────────────────────────────────
+
+    def _on_show_git(self, _btn):
+        if not self._root_path or not self._is_git:
+            return
+        from .git_dialog import GitDialog
+        d = GitDialog(root=self._root_path)
+        d.present(self)
+
+    # ── toast helpers ─────────────────────────────────────────────────────
+
+    def _toast(self, title: str, error: bool = False):
+        t = Adw.Toast(title=title, timeout=3 if not error else 0)
+        if error:
+            t.set_button_label("OK")
+        self._toast_overlay.add_toast(t)
