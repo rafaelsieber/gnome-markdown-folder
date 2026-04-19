@@ -545,6 +545,29 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self.get_application().set_accels_for_action("win.open-folder",
                                                      ["<primary>o"])
 
+        # F6 — toggle focus between sidebar tree and editor
+        a = Gio.SimpleAction.new("focus-toggle", None)
+        a.connect("activate", self._on_focus_toggle)
+        self.add_action(a)
+        self.get_application().set_accels_for_action("win.focus-toggle", ["F6"])
+
+        # Focus sidebar (Ctrl+0)
+        a = Gio.SimpleAction.new("focus-sidebar", None)
+        a.connect("activate", lambda *_: self._tree_view.grab_focus())
+        self.add_action(a)
+        self.get_application().set_accels_for_action("win.focus-sidebar",
+                                                     ["<primary>0"])
+
+    def _on_focus_toggle(self, *_):
+        """Alternate focus between sidebar tree and active editor."""
+        page = self._tab_view.get_selected_page()
+        if self._tree_view.has_focus():
+            if page:
+                ep: EditorPage = page._editor  # type: ignore[attr-defined]
+                ep.text_view.grab_focus()
+        else:
+            self._tree_view.grab_focus()
+
     # ── folder loading ────────────────────────────────────────────────────
 
     def _on_open_folder(self, _btn):
@@ -644,20 +667,24 @@ class MarkdownWindow(Adw.ApplicationWindow):
 
         self._content_stack.set_visible_child_name("tabs")
 
+        # Block tab-changed signal while setting up the page so that
+        # _on_tab_changed doesn't fire before page._editor is assigned
+        # (append() auto-selects when it's the first tab).
+        self._tab_view.handler_block_by_func(self._on_tab_changed)
         page = self._tab_view.append(ep.root)
         page.set_title(path.name)
         page.set_icon(Gio.ThemedIcon.new("text-x-generic-symbolic"))
         page.set_tooltip(str(path))
-
-        # store cross-reference
         page._editor = ep  # type: ignore[attr-defined]
         self._open_tabs[path] = page
+        self._tab_view.handler_unblock_by_func(self._on_tab_changed)
 
         self._tab_view.set_selected_page(page)
 
-        # always open in preview mode
+        # always open in preview mode; focus preview widget
         ep.show_preview()
         self._toggle_group.set_active_name("preview")
+        ep.preview_view.grab_focus()
 
     def _on_tab_changed(self, tab_view, _param):
         page = tab_view.get_selected_page()
@@ -741,10 +768,75 @@ class MarkdownWindow(Adw.ApplicationWindow):
         if page is None:
             return
         ep: EditorPage = page._editor  # type: ignore[attr-defined]
-        if ep.save():
-            self._toast(f"Saved {ep.path.name}")
-        else:
+        if not ep.save():
             self._toast(f"Could not save {ep.path.name}", error=True)
+            return
+        self._toast(f"Saved {ep.path.name}")
+        if self._is_git and self._root_path:
+            self._ask_git_commit(ep)
+
+    def _ask_git_commit(self, ep: EditorPage):
+        """Offer to commit the saved file into the git repo."""
+        try:
+            rel = ep.path.relative_to(self._root_path)
+        except ValueError:
+            return
+
+        default_msg = f"Update {ep.path.name}"
+
+        entry = Adw.EntryRow(title="Commit message", text=default_msg)
+        listbox = Gtk.ListBox(
+            css_classes=["boxed-list"],
+            margin_top=8,
+            selection_mode=Gtk.SelectionMode.NONE,
+        )
+        listbox.append(entry)
+
+        dialog = Adw.AlertDialog(
+            heading="Commit to git?",
+            body=f"Stage and commit  {rel}",
+        )
+        dialog.set_extra_child(listbox)
+        dialog.add_response("skip", "Skip")
+        dialog.add_response("commit", "Commit")
+        dialog.set_response_appearance("commit", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("commit")
+        dialog.set_close_response("skip")
+
+        def on_response(_d, response):
+            if response != "commit":
+                return
+            msg = entry.get_text().strip() or default_msg
+            self._do_git_commit(rel, msg)
+
+        dialog.connect("response", on_response)
+        # give entry focus so user can edit message immediately
+        GLib.idle_add(lambda: entry.grab_focus() or False)
+        dialog.present(self)
+
+    def _do_git_commit(self, rel_path: Path, message: str):
+        def worker():
+            _, err_add, rc_add = _run_git(
+                self._root_path, "add", str(rel_path)
+            )
+            if rc_add != 0:
+                GLib.idle_add(
+                    lambda: self._toast(f"git add failed: {err_add.strip()}", error=True) or False
+                )
+                return
+            _, err_cm, rc_cm = _run_git(
+                self._root_path, "commit", "-m", message
+            )
+            if rc_cm != 0:
+                GLib.idle_add(
+                    lambda: self._toast(f"git commit failed: {err_cm.strip()}", error=True) or False
+                )
+            else:
+                GLib.idle_add(
+                    lambda: self._toast(f"Committed: {message[:50]}") or False
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_editor_saved(self, ep: EditorPage):
         self._save_btn.set_sensitive(False)
