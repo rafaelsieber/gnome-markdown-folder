@@ -488,6 +488,16 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self._save_btn.connect("clicked", lambda _: self._save_current())
         hbar.pack_end(self._save_btn)
 
+        # History button (git log for current file)
+        self._history_btn = Gtk.Button(
+            icon_name="document-open-recent-symbolic",
+            tooltip_text="File history (git log)",
+            sensitive=False,
+            visible=False,
+        )
+        self._history_btn.connect("clicked", self._on_show_history)
+        hbar.pack_end(self._history_btn)
+
         # Edit / Preview toggle group (libadwaita 1.7)
         self._toggle_group = Adw.ToggleGroup()
         self._toggle_group.add_css_class("flat")
@@ -532,6 +542,12 @@ class MarkdownWindow(Adw.ApplicationWindow):
     # ── actions / shortcuts ───────────────────────────────────────────────
 
     def _setup_actions(self):
+        # Close current tab (Ctrl+W) — handled manually so it never closes the window
+        a = Gio.SimpleAction.new("close-tab", None)
+        a.connect("activate", lambda *_: self._close_current_tab())
+        self.add_action(a)
+        self.get_application().set_accels_for_action("win.close-tab", ["<primary>w"])
+
         # Save
         a = Gio.SimpleAction.new("save", None)
         a.connect("activate", lambda *_: self._save_current())
@@ -567,6 +583,14 @@ class MarkdownWindow(Adw.ApplicationWindow):
                 ep.text_view.grab_focus()
         else:
             self._tree_view.grab_focus()
+
+    def _close_current_tab(self):
+        """Close the current tab, or close the window if no tabs are open."""
+        page = self._tab_view.get_selected_page()
+        if page is None:
+            self.close()
+            return
+        self._tab_view.close_page(page)
 
     # ── folder loading ────────────────────────────────────────────────────
 
@@ -702,6 +726,7 @@ class MarkdownWindow(Adw.ApplicationWindow):
             )
             self._save_btn.set_sensitive(False)
             self._toggle_group.set_sensitive(False)
+            self._history_btn.set_visible(False)
             return
 
         ep: EditorPage = page._editor  # type: ignore[attr-defined]
@@ -717,6 +742,8 @@ class MarkdownWindow(Adw.ApplicationWindow):
 
         self._save_btn.set_sensitive(ep.get_modified())
         self._toggle_group.set_sensitive(True)
+        self._history_btn.set_visible(self._is_git)
+        self._history_btn.set_sensitive(self._is_git)
         # sync toggle to current view of this tab (no signal loop)
         self._toggle_group.handler_block_by_func(self._on_view_toggled)
         self._toggle_group.set_active_name(ep.current_view_name())
@@ -742,6 +769,7 @@ class MarkdownWindow(Adw.ApplicationWindow):
             )
             self._save_btn.set_sensitive(False)
             self._toggle_group.set_sensitive(False)
+            self._history_btn.set_sensitive(False)
 
     def _ask_save_close(self, ep: EditorPage, page: Adw.TabPage):
         dialog = Adw.AlertDialog(
@@ -871,6 +899,15 @@ class MarkdownWindow(Adw.ApplicationWindow):
             return
         from .git_dialog import GitDialog
         d = GitDialog(root=self._root_path)
+        d.present(self)
+
+    def _on_show_history(self, _btn):
+        page = self._tab_view.get_selected_page()
+        if page is None or not self._root_path or not self._is_git:
+            return
+        ep: EditorPage = page._editor  # type: ignore[attr-defined]
+        from .history_dialog import HistoryDialog
+        d = HistoryDialog(file_path=ep.path, root=self._root_path)
         d.present(self)
 
     # ── toast helpers ─────────────────────────────────────────────────────
