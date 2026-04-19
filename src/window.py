@@ -567,6 +567,12 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self.add_action(a)
         self.get_application().set_accels_for_action("win.new-file", ["<primary>n"])
 
+        # Delete selected file (Ctrl+D)
+        a = Gio.SimpleAction.new("delete-file", None)
+        a.connect("activate", lambda *_: self._on_delete_file())
+        self.add_action(a)
+        self.get_application().set_accels_for_action("win.delete-file", ["<primary>d"])
+
         # F6 — toggle focus between sidebar tree and editor
         a = Gio.SimpleAction.new("focus-toggle", None)
         a.connect("activate", self._on_focus_toggle)
@@ -672,6 +678,48 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self._toggle_group.handler_unblock_by_func(self._on_view_toggled)
         ep.text_view.grab_focus()
         return False
+
+    def _on_delete_file(self):
+        sel = self._tree_view.get_selection()
+        model, it = sel.get_selected()
+        if it is None:
+            return
+        is_dir = model.get_value(it, 2)
+        if is_dir:
+            self._toast("Cannot delete folders here", error=True)
+            return
+        path = Path(model.get_value(it, 1))
+
+        dialog = Adw.AlertDialog(
+            heading="Delete file?",
+            body=str(path.name),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response):
+            if response != "delete":
+                return
+            # Close the tab if the file is open
+            if path in self._open_tabs:
+                page = self._open_tabs[path]
+                self._close_tab(page)
+            try:
+                path.unlink()
+            except OSError as e:
+                self._toast(f"Could not delete: {e}", error=True)
+                return
+            # Refresh tree
+            if self._root_path:
+                self._tree_store.clear()
+                self._populate_tree(None, self._root_path)
+            self._toast(f"Deleted {path.name}")
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
 
     def _on_focus_toggle(self, *_):
         """Alternate focus between sidebar tree and active editor."""
