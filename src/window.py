@@ -244,6 +244,18 @@ def _render_markdown(tv: Gtk.TextView, text: str):
     tag("hr", foreground="#555555")
     tag("bullet", left_margin=20)
     tag("link", foreground="#4a9eff", underline=Pango.Underline.SINGLE)
+    tag("th", family="monospace", weight=Pango.Weight.BOLD,
+        background="#2a2a2a", foreground="#ffffff",
+        left_margin=16, right_margin=16,
+        pixels_above_lines=3, pixels_below_lines=3)
+    tag("td", family="monospace",
+        left_margin=16, right_margin=16,
+        pixels_above_lines=2, pixels_below_lines=2)
+    tag("td_alt", family="monospace",
+        background="#1a1a1a",
+        left_margin=16, right_margin=16,
+        pixels_above_lines=2, pixels_below_lines=2)
+    tag("table_border", foreground="#444444", family="monospace")
 
     _INLINE = re.compile(
         r'\*\*(.+?)\*\*'       # **bold**
@@ -282,14 +294,68 @@ def _render_markdown(tv: Gtk.TextView, text: str):
             else:
                 buf.insert(e, rest)
 
+    def _is_table_row(l: str) -> bool:
+        return l.strip().startswith("|") and l.strip().endswith("|")
+
+    def _is_separator_row(l: str) -> bool:
+        return bool(re.match(r'^\|[\s\-:|]+\|', l.strip()))
+
+    def _parse_cells(l: str) -> list[str]:
+        return [c.strip() for c in l.strip().strip("|").split("|")]
+
+    def _render_table(table_lines: list[str]):
+        # filter out separator rows
+        rows = [l for l in table_lines if not _is_separator_row(l)]
+        if not rows:
+            return
+        # compute column widths
+        parsed = [_parse_cells(r) for r in rows]
+        ncols = max(len(r) for r in parsed)
+        widths = [0] * ncols
+        for row in parsed:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+
+        sep = "┼".join("─" * (w + 2) for w in widths)
+        top = "┬".join("─" * (w + 2) for w in widths)
+        bot = "┴".join("─" * (w + 2) for w in widths)
+
+        buf.insert_with_tags_by_name(buf.get_end_iter(), "┌" + top + "┐\n", "table_border")
+
+        for row_idx, (raw, cells) in enumerate(zip(rows, parsed)):
+            # pad cells
+            padded = []
+            for i in range(ncols):
+                cell = cells[i] if i < len(cells) else ""
+                padded.append(f" {cell:<{widths[i]}} ")
+            line = "│" + "│".join(padded) + "│\n"
+            cell_tag = "th" if row_idx == 0 else ("td" if row_idx % 2 == 1 else "td_alt")
+            buf.insert_with_tags_by_name(buf.get_end_iter(), line, cell_tag)
+            if row_idx < len(rows) - 1:
+                divider = ("┿" if row_idx == 0 else "┼").join(
+                    ("━" if row_idx == 0 else "─") * (w + 2) for w in widths
+                )
+                left  = "╞" if row_idx == 0 else "├"
+                right = "╡" if row_idx == 0 else "┤"
+                buf.insert_with_tags_by_name(
+                    buf.get_end_iter(), left + divider + right + "\n", "table_border"
+                )
+
+        buf.insert_with_tags_by_name(buf.get_end_iter(), "└" + bot + "┘\n", "table_border")
+
     lines = text.split("\n")
     in_code = False
     code_lines: list[str] = []
+    table_lines: list[str] = []
+
+    def flush_table():
+        if table_lines:
+            _render_table(list(table_lines))
+            table_lines.clear()
 
     for line in lines:
-        e = buf.get_end_iter()
-
         if line.startswith("```"):
+            flush_table()
             if in_code:
                 in_code = False
                 block = "\n".join(code_lines)
@@ -303,6 +369,12 @@ def _render_markdown(tv: Gtk.TextView, text: str):
         if in_code:
             code_lines.append(line)
             continue
+
+        if _is_table_row(line):
+            table_lines.append(line)
+            continue
+        else:
+            flush_table()
 
         if line.startswith("#### "):
             insert_inline(line[5:], "h4"); buf.insert(buf.get_end_iter(), "\n")
@@ -332,6 +404,8 @@ def _render_markdown(tv: Gtk.TextView, text: str):
         else:
             insert_inline(line)
             buf.insert(buf.get_end_iter(), "\n")
+
+    flush_table()
 
 
 # ── main window ───────────────────────────────────────────────────────────────
