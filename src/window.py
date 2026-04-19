@@ -637,17 +637,21 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self._populate_tree(it, dir_path)
         return False  # allow expansion
 
-    def _on_row_activated(self, _tv, path, _col):
-        it = self._tree_store.get_iter(path)
+    def _on_row_activated(self, _tv, tree_path, _col):
+        it = self._tree_store.get_iter(tree_path)
         if not it:
             return
         is_dir = self._tree_store.get_value(it, 2)
         if is_dir:
+            # Enter / double-click toggles expand/collapse
+            if self._tree_view.row_expanded(tree_path):
+                self._tree_view.collapse_row(tree_path)
+            else:
+                self._tree_view.expand_row(tree_path, False)
             return
         file_path = Path(self._tree_store.get_value(it, 1))
         if file_path.exists():
             self.open_file(file_path)
-            # on mobile (collapsed), show content pane
             self._split_view.set_show_content(True)
 
     # ── tab management ────────────────────────────────────────────────────
@@ -680,6 +684,9 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self._tab_view.handler_unblock_by_func(self._on_tab_changed)
 
         self._tab_view.set_selected_page(page)
+        # Force _on_tab_changed: if append() auto-selected the page (first tab),
+        # set_selected_page is a no-op and the signal never fires.
+        self._on_tab_changed(self._tab_view, None)
 
         # always open in preview mode; focus preview widget
         ep.show_preview()
