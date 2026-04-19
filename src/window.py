@@ -967,9 +967,7 @@ class MarkdownWindow(Adw.ApplicationWindow):
             _, err_add, rc_add = _run_git(self._root_path, "add", str(rel_path))
             if rc_add != 0:
                 GLib.idle_add(
-                    lambda: self._toast(
-                        f"git add failed (cwd={self._root_path}, file={rel_path}): {err_add.strip()}",
-                        error=True) or False
+                    lambda: self._toast(f"git add failed: {err_add.strip()}", error=True) or False
                 )
                 return
             _, err_cm, rc_cm = _run_git(self._root_path, "commit", "-m", message)
