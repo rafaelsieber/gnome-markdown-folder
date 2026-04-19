@@ -603,11 +603,18 @@ class MarkdownWindow(Adw.ApplicationWindow):
         if page is None:
             return
         ep: EditorPage = page._editor  # type: ignore[attr-defined]
-        ep.show_edit()
-        self._toggle_group.handler_block_by_func(self._on_view_toggled)
-        self._toggle_group.set_active_name("edit")
-        self._toggle_group.handler_unblock_by_func(self._on_view_toggled)
-        ep.text_view.grab_focus()
+        if ep.current_view_name() == "edit":
+            ep.show_preview()
+            self._toggle_group.handler_block_by_func(self._on_view_toggled)
+            self._toggle_group.set_active_name("preview")
+            self._toggle_group.handler_unblock_by_func(self._on_view_toggled)
+            ep.preview_view.grab_focus()
+        else:
+            ep.show_edit()
+            self._toggle_group.handler_block_by_func(self._on_view_toggled)
+            self._toggle_group.set_active_name("edit")
+            self._toggle_group.handler_unblock_by_func(self._on_view_toggled)
+            ep.text_view.grab_focus()
 
     # ── folder loading ────────────────────────────────────────────────────
 
