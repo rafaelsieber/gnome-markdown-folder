@@ -13,6 +13,7 @@ Main window — uses the most modern libadwaita 1.10 / GTK4 widgets:
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from pathlib import Path
@@ -50,6 +51,30 @@ def _is_git_repo(path: Path) -> bool:
 
 
 _MD_EXTS = {".md", ".markdown", ".mdx", ".txt", ".rst"}
+
+APP_ID = "io.github.rafaelsieber.markdownfolder"
+
+
+# ── user config ───────────────────────────────────────────────────────────────
+
+def _config_path() -> Path:
+    cfg_dir = Path(GLib.get_user_config_dir()) / APP_ID
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    return cfg_dir / "config.json"
+
+
+def _load_config() -> dict:
+    try:
+        return json.loads(_config_path().read_text())
+    except Exception:
+        return {}
+
+
+def _save_config(data: dict):
+    try:
+        _config_path().write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
 
 
 # ── per-tab editor state ─────────────────────────────────────────────────────
@@ -326,6 +351,7 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self._build_ui()
         self._setup_actions()
         self._setup_breakpoint()
+        self._restore_last_folder()
 
     # ── breakpoint (responsive) ───────────────────────────────────────────
 
@@ -471,7 +497,7 @@ class MarkdownWindow(Adw.ApplicationWindow):
         t_prev = Adw.Toggle(label="Preview", name="preview")
         self._toggle_group.add(t_edit)
         self._toggle_group.add(t_prev)
-        self._toggle_group.set_active_name("edit")
+        self._toggle_group.set_active_name("preview")
         self._toggle_group.connect("notify::active-name", self._on_view_toggled)
         hbar.pack_end(self._toggle_group)
 
@@ -542,6 +568,18 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self.set_title(f"Markdown Folder — {path.name}")
         self._tree_store.clear()
         self._populate_tree(None, path)
+        # persist last folder
+        cfg = _load_config()
+        cfg["last_folder"] = str(path)
+        _save_config(cfg)
+
+    def _restore_last_folder(self):
+        cfg = _load_config()
+        last = cfg.get("last_folder")
+        if last:
+            p = Path(last)
+            if p.is_dir():
+                GLib.idle_add(lambda: self.load_folder(p) or False)
 
     def _populate_tree(self, parent_it, directory: Path, depth: int = 0):
         if depth > 12:
@@ -617,6 +655,10 @@ class MarkdownWindow(Adw.ApplicationWindow):
 
         self._tab_view.set_selected_page(page)
 
+        # always open in preview mode
+        ep.show_preview()
+        self._toggle_group.set_active_name("preview")
+
     def _on_tab_changed(self, tab_view, _param):
         page = tab_view.get_selected_page()
         if page is None:
@@ -641,10 +683,10 @@ class MarkdownWindow(Adw.ApplicationWindow):
 
         self._save_btn.set_sensitive(ep.get_modified())
         self._toggle_group.set_sensitive(True)
-        # sync toggle to current view
-        view_name = ep.current_view_name()
-        if self._toggle_group.get_active_name() != view_name:
-            self._toggle_group.set_active_name(view_name)
+        # sync toggle to current view of this tab (no signal loop)
+        self._toggle_group.handler_block_by_func(self._on_view_toggled)
+        self._toggle_group.set_active_name(ep.current_view_name())
+        self._toggle_group.handler_unblock_by_func(self._on_view_toggled)
 
     def _on_tab_close(self, _tv, page) -> bool:
         ep: EditorPage = page._editor  # type: ignore[attr-defined]
