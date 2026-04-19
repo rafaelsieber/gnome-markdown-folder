@@ -561,6 +561,12 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self.get_application().set_accels_for_action("win.open-folder",
                                                      ["<primary>o"])
 
+        # New file (Ctrl+N)
+        a = Gio.SimpleAction.new("new-file", None)
+        a.connect("activate", lambda *_: self._on_new_file())
+        self.add_action(a)
+        self.get_application().set_accels_for_action("win.new-file", ["<primary>n"])
+
         # F6 — toggle focus between sidebar tree and editor
         a = Gio.SimpleAction.new("focus-toggle", None)
         a.connect("activate", self._on_focus_toggle)
@@ -573,6 +579,99 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self.add_action(a)
         self.get_application().set_accels_for_action("win.focus-sidebar",
                                                      ["<primary>0"])
+
+    def _selected_tree_dir(self) -> Path | None:
+        """Return the directory that is currently active in the tree.
+
+        If a file row is selected → its parent directory.
+        If a directory row is selected → that directory.
+        Falls back to the root folder if nothing is selected.
+        """
+        if self._root_path is None:
+            return None
+        sel = self._tree_view.get_selection()
+        model, it = sel.get_selected()
+        if it is None:
+            return self._root_path
+        is_dir = model.get_value(it, 2)
+        path = Path(model.get_value(it, 1))
+        return path if is_dir else path.parent
+
+    def _on_new_file(self):
+        target_dir = self._selected_tree_dir()
+        if target_dir is None:
+            self._toast("Open a folder first", error=True)
+            return
+
+        entry = Adw.EntryRow(title="File name", text="new-file.md")
+        listbox = Gtk.ListBox(
+            css_classes=["boxed-list"],
+            margin_top=8,
+            selection_mode=Gtk.SelectionMode.NONE,
+        )
+        listbox.append(entry)
+
+        dialog = Adw.AlertDialog(
+            heading="New file",
+            body=str(target_dir),
+        )
+        dialog.set_extra_child(listbox)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("create", "Create")
+        dialog.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("create")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response):
+            if response != "create":
+                return
+            name = entry.get_text().strip()
+            if not name:
+                return
+            if not name.endswith(tuple(_MD_EXTS)):
+                name += ".md"
+            new_path = target_dir / name
+            if new_path.exists():
+                self._toast(f"{name} already exists", error=True)
+                return
+            try:
+                new_path.touch()
+            except OSError as e:
+                self._toast(f"Could not create file: {e}", error=True)
+                return
+            # Refresh the tree so the new file appears
+            if self._root_path:
+                self._tree_store.clear()
+                self._populate_tree(None, self._root_path)
+            self.open_file(new_path)
+            self._split_view.set_show_content(True)
+            # Switch straight to edit mode for the new file
+            GLib.idle_add(self._switch_new_file_to_edit)
+
+        def _select_entry_text():
+            # Select the filename without extension for easy overtyping
+            txt = entry.get_text()
+            dot = txt.rfind(".")
+            entry.grab_focus()
+            if dot > 0:
+                entry.select_region(0, dot)
+            return False
+
+        dialog.connect("response", on_response)
+        GLib.idle_add(_select_entry_text)
+        dialog.present(self)
+
+    def _switch_new_file_to_edit(self):
+        page = self._tab_view.get_selected_page()
+        if page is None:
+            return False
+        ep: EditorPage = page._editor  # type: ignore[attr-defined]
+        ep.show_edit()
+        self._toggle_group.handler_block_by_func(self._on_view_toggled)
+        self._toggle_group.set_active_name("edit")
+        self._toggle_group.handler_unblock_by_func(self._on_view_toggled)
+        ep.text_view.grab_focus()
+        return False
 
     def _on_focus_toggle(self, *_):
         """Alternate focus between sidebar tree and active editor."""
