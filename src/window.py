@@ -35,10 +35,14 @@ except Exception:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _run_git(cwd: Path, *args: str) -> tuple[str, str, int]:
-    import subprocess
+    import subprocess, os
+    env = os.environ.copy()
+    env["GIT_EDITOR"] = "true"
+    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
         r = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=15
+            ["git", *args], cwd=cwd, capture_output=True, text=True,
+            timeout=15, env=env
         )
         return r.stdout, r.stderr, r.returncode
     except Exception as e:
@@ -842,7 +846,7 @@ class MarkdownWindow(Adw.ApplicationWindow):
                 )
                 return
             _, err_cm, rc_cm = _run_git(
-                self._root_path, "commit", "-m", message
+                self._root_path, "commit", "--no-edit", "-m", message
             )
             if rc_cm != 0:
                 GLib.idle_add(
