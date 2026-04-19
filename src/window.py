@@ -304,11 +304,9 @@ def _render_markdown(tv: Gtk.TextView, text: str):
         return [c.strip() for c in l.strip().strip("|").split("|")]
 
     def _render_table(table_lines: list[str]):
-        # filter out separator rows
         rows = [l for l in table_lines if not _is_separator_row(l)]
         if not rows:
             return
-        # compute column widths
         parsed = [_parse_cells(r) for r in rows]
         ncols = max(len(r) for r in parsed)
         widths = [0] * ncols
@@ -316,32 +314,29 @@ def _render_markdown(tv: Gtk.TextView, text: str):
             for i, cell in enumerate(row):
                 widths[i] = max(widths[i], len(cell))
 
-        sep = "┼".join("─" * (w + 2) for w in widths)
-        top = "┬".join("─" * (w + 2) for w in widths)
-        bot = "┴".join("─" * (w + 2) for w in widths)
+        def make_sep(char="─", join="┼"):
+            return join.join(char * (w + 2) for w in widths) + "\n"
 
-        buf.insert_with_tags_by_name(buf.get_end_iter(), "┌" + top + "┐\n", "table_border")
-
-        for row_idx, (raw, cells) in enumerate(zip(rows, parsed)):
-            # pad cells
-            padded = []
+        for row_idx, cells in enumerate(parsed):
+            # build full line with separators — all one piece so bg covers entire line
+            parts = []
             for i in range(ncols):
                 cell = cells[i] if i < len(cells) else ""
-                padded.append(f" {cell:<{widths[i]}} ")
-            line = "│" + "│".join(padded) + "│\n"
-            cell_tag = "th" if row_idx == 0 else ("td" if row_idx % 2 == 1 else "td_alt")
-            buf.insert_with_tags_by_name(buf.get_end_iter(), line, cell_tag)
-            if row_idx < len(rows) - 1:
-                divider = ("┿" if row_idx == 0 else "┼").join(
-                    ("━" if row_idx == 0 else "─") * (w + 2) for w in widths
-                )
-                left  = "╞" if row_idx == 0 else "├"
-                right = "╡" if row_idx == 0 else "┤"
-                buf.insert_with_tags_by_name(
-                    buf.get_end_iter(), left + divider + right + "\n", "table_border"
-                )
+                parts.append(f" {cell:<{widths[i]}} ")
+            line = "│".join(parts) + "\n"
 
-        buf.insert_with_tags_by_name(buf.get_end_iter(), "└" + bot + "┘\n", "table_border")
+            if row_idx == 0:
+                buf.insert_with_tags_by_name(buf.get_end_iter(), line, "th")
+                buf.insert_with_tags_by_name(buf.get_end_iter(),
+                                             make_sep("━", "┿"), "table_border")
+            else:
+                tag_name = "td" if row_idx % 2 == 1 else "td_alt"
+                buf.insert_with_tags_by_name(buf.get_end_iter(), line, tag_name)
+                if row_idx < len(parsed) - 1:
+                    buf.insert_with_tags_by_name(buf.get_end_iter(),
+                                                 make_sep(), "table_border")
+
+        buf.insert(buf.get_end_iter(), "\n")
 
     lines = text.split("\n")
     in_code = False
