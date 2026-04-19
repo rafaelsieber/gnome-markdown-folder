@@ -35,14 +35,10 @@ except Exception:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _run_git(cwd: Path, *args: str) -> tuple[str, str, int]:
-    import subprocess, os
-    env = os.environ.copy()
-    env["GIT_EDITOR"] = "true"
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    import subprocess
     try:
         r = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True,
-            timeout=15, env=env
+            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=15
         )
         return r.stdout, r.stderr, r.returncode
     except Exception as e:
@@ -835,22 +831,50 @@ class MarkdownWindow(Adw.ApplicationWindow):
                 return
             self._do_git_commit(rel, f"Update {ep.path.name}")
 
+    def _ask_git_commit(self, ep: EditorPage, rel: Path):
+        default_msg = f"Update {ep.path.name}"
+
+        entry = Adw.EntryRow(title="Commit message", text=default_msg)
+        listbox = Gtk.ListBox(
+            css_classes=["boxed-list"],
+            margin_top=8,
+            selection_mode=Gtk.SelectionMode.NONE,
+        )
+        listbox.append(entry)
+
+        dialog = Adw.AlertDialog(
+            heading="Commit to git?",
+            body=str(rel),
+        )
+        dialog.set_extra_child(listbox)
+        dialog.add_response("skip", "Skip")
+        dialog.add_response("commit", "Commit")
+        dialog.set_response_appearance("commit", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("commit")
+        dialog.set_close_response("skip")
+
+        def on_response(_d, response):
+            if response != "commit":
+                return
+            msg = entry.get_text().strip() or default_msg
+            self._do_git_commit(rel, msg)
+
+        dialog.connect("response", on_response)
+        GLib.idle_add(lambda: entry.grab_focus() or False)
+        dialog.present(self)
+
     def _do_git_commit(self, rel_path: Path, message: str):
         def worker():
-            _, err_add, rc_add = _run_git(
-                self._root_path, "add", str(rel_path)
-            )
+            _, err_add, rc_add = _run_git(self._root_path, "add", str(rel_path))
             if rc_add != 0:
                 GLib.idle_add(
-                    lambda: self._toast("Saved (git commit skipped)") or False
+                    lambda: self._toast(f"git add failed: {err_add.strip()}", error=True) or False
                 )
                 return
-            _, err_cm, rc_cm = _run_git(
-                self._root_path, "commit", "--no-edit", "-m", message
-            )
+            _, err_cm, rc_cm = _run_git(self._root_path, "commit", "-m", message)
             if rc_cm != 0:
                 GLib.idle_add(
-                    lambda: self._toast("Saved (git commit skipped)") or False
+                    lambda: self._toast(f"git commit failed: {err_cm.strip()}", error=True) or False
                 )
             else:
                 GLib.idle_add(
