@@ -548,6 +548,12 @@ class MarkdownWindow(Adw.ApplicationWindow):
         self.add_action(a)
         self.get_application().set_accels_for_action("win.close-tab", ["<primary>w"])
 
+        # Switch to edit mode (Ctrl+E)
+        a = Gio.SimpleAction.new("edit-mode", None)
+        a.connect("activate", self._on_edit_mode)
+        self.add_action(a)
+        self.get_application().set_accels_for_action("win.edit-mode", ["<primary>e"])
+
         # Save
         a = Gio.SimpleAction.new("save", None)
         a.connect("activate", lambda *_: self._save_current())
@@ -591,6 +597,17 @@ class MarkdownWindow(Adw.ApplicationWindow):
             self.close()
             return
         self._tab_view.close_page(page)
+
+    def _on_edit_mode(self, *_):
+        page = self._tab_view.get_selected_page()
+        if page is None:
+            return
+        ep: EditorPage = page._editor  # type: ignore[attr-defined]
+        ep.show_edit()
+        self._toggle_group.handler_block_by_func(self._on_view_toggled)
+        self._toggle_group.set_active_name("edit")
+        self._toggle_group.handler_unblock_by_func(self._on_view_toggled)
+        ep.text_view.grab_focus()
 
     # ── folder loading ────────────────────────────────────────────────────
 
@@ -808,46 +825,11 @@ class MarkdownWindow(Adw.ApplicationWindow):
             return
         self._toast(f"Saved {ep.path.name}")
         if self._is_git and self._root_path:
-            self._ask_git_commit(ep)
-
-    def _ask_git_commit(self, ep: EditorPage):
-        """Offer to commit the saved file into the git repo."""
-        try:
-            rel = ep.path.relative_to(self._root_path)
-        except ValueError:
-            return
-
-        default_msg = f"Update {ep.path.name}"
-
-        entry = Adw.EntryRow(title="Commit message", text=default_msg)
-        listbox = Gtk.ListBox(
-            css_classes=["boxed-list"],
-            margin_top=8,
-            selection_mode=Gtk.SelectionMode.NONE,
-        )
-        listbox.append(entry)
-
-        dialog = Adw.AlertDialog(
-            heading="Commit to git?",
-            body=f"Stage and commit  {rel}",
-        )
-        dialog.set_extra_child(listbox)
-        dialog.add_response("skip", "Skip")
-        dialog.add_response("commit", "Commit")
-        dialog.set_response_appearance("commit", Adw.ResponseAppearance.SUGGESTED)
-        dialog.set_default_response("commit")
-        dialog.set_close_response("skip")
-
-        def on_response(_d, response):
-            if response != "commit":
+            try:
+                rel = ep.path.relative_to(self._root_path)
+            except ValueError:
                 return
-            msg = entry.get_text().strip() or default_msg
-            self._do_git_commit(rel, msg)
-
-        dialog.connect("response", on_response)
-        # give entry focus so user can edit message immediately
-        GLib.idle_add(lambda: entry.grab_focus() or False)
-        dialog.present(self)
+            self._do_git_commit(rel, f"Update {ep.path.name}")
 
     def _do_git_commit(self, rel_path: Path, message: str):
         def worker():
