@@ -20,7 +20,7 @@ from pathlib import Path
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+from gi.repository import Adw, Gio, GLib, GObject, Gtk, Pango
 
 # Optional: GtkSource for syntax highlighting
 try:
@@ -333,7 +333,7 @@ class MarkdownWindow(Adw.ApplicationWindow):
         bp = Adw.Breakpoint()
         condition = Adw.BreakpointCondition.parse("max-width: 720sp")
         bp.set_condition(condition)
-        bp.add_setter(self._split_view, "collapsed", GLib.Variant.new_boolean(True))
+        bp.add_setter(self._split_view, "collapsed", True)
         self.add_breakpoint(bp)
 
     # ── UI construction ───────────────────────────────────────────────────
