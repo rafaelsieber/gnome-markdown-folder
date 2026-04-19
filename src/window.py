@@ -842,7 +842,7 @@ class MarkdownWindow(Adw.ApplicationWindow):
             )
             if rc_add != 0:
                 GLib.idle_add(
-                    lambda: self._toast(f"git add failed: {err_add.strip()}", error=True) or False
+                    lambda: self._toast("Saved (git commit skipped)") or False
                 )
                 return
             _, err_cm, rc_cm = _run_git(
@@ -850,7 +850,7 @@ class MarkdownWindow(Adw.ApplicationWindow):
             )
             if rc_cm != 0:
                 GLib.idle_add(
-                    lambda: self._toast(f"git commit failed: {err_cm.strip()}", error=True) or False
+                    lambda: self._toast("Saved (git commit skipped)") or False
                 )
             else:
                 GLib.idle_add(
