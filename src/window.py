@@ -245,7 +245,6 @@ def _render_markdown(tv: Gtk.TextView, text: str):
     tag("bullet", left_margin=20)
     tag("link", foreground="#4a9eff", underline=Pango.Underline.SINGLE)
     tag("th", family="monospace", weight=Pango.Weight.BOLD,
-        background="#2a2a2a", foreground="#ffffff",
         left_margin=16, right_margin=16,
         pixels_above_lines=3, pixels_below_lines=3)
     tag("td", family="monospace",
